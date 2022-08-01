@@ -166,11 +166,10 @@ impl Vfs {
 
     fn read_tmpvfs() -> Files {
         let mut files = fs::read_to_string("./tmp.vfs").unwrap();
-        let mut files = files.clone().replace("\r\n", " ").clone();
-        let mut files: Vec<&str> = files.split_whitespace().collect();
+        let mut files: Vec<&str> = files.split("\r\n").clone().collect();
         let mut out = Files::new(vec![]);
         for file in files {
-            let name_path: Vec<&str> = file.split(NAME_PATH_SPLITTER).collect();
+            let name_path: Vec<&str> = file.trim().split(NAME_PATH_SPLITTER).collect();
             out.add_file(File::new(
                 name_path.get(0).unwrap().to_string(),
                 name_path.get(1).unwrap_or(&"").to_string())
@@ -193,7 +192,7 @@ impl VfsT for Vfs {
     fn path_by_name(&self, name: String) -> Option<String> {
         for file in self.files.files.clone().into_iter() {
             if file.name == name {
-                return Some(file.name);
+                return Some(file.path);
             }
         }
         return None;
@@ -243,12 +242,15 @@ fn response_file(mut stream: TcpStream, vfs: Vfs) {
 
     let headers = bytes2string(&buffer);
     let headers: Vec<&str> = headers.split_whitespace().collect();
-    let mut requested_file = String::from(headers[1]);
-    requested_file.remove(0);
-    let mut file = vfs.file_by_name(requested_file).unwrap_or(File::new("tmp.vfs".to_string(), "".to_string()));
+    unsafe {
+        let mut requested_file = String::from(headers.get(1).unwrap_unchecked().to_string());
 
-    stream.write(&*make_response(&file)).unwrap();
-    stream.flush().unwrap();
+        requested_file.remove(0);
+        let mut file = vfs.file_by_name(requested_file).unwrap_or(File::new("tmp.vfs".to_string(), "".to_string()));
+
+        stream.write(&*make_response(&file)).unwrap();
+        stream.flush().unwrap();
+    }
 }
 
 fn set_clipboard() {
