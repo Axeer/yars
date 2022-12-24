@@ -1,19 +1,27 @@
-use std::io::prelude::*;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::fs;
-use std::io::Bytes;
-use std::str;
-use std::cmp::Ordering;
-
-use cli_clipboard;
+use {
+    std::io::prelude::*,
+    std::net::TcpListener,
+    std::net::TcpStream,
+    std::fs,
+    std::str,
+    std::cmp::Ordering,
+    cli_clipboard,
+};
 
 const MAX_SIZE: usize = 128 * 1024;
-const TEST_FILE: &'static str = "testfile";
-const BASE_ADDRESS: &'static str = "127.0.0.1:7878";
+const BASE_ADDRESS: &'static str = "127.0.0.1:8888";
 const NAME_PATH_SPLITTER: &'static str = "$";
 
 type TsizeBuf<'a, const N: usize> = &'a [u8; N];
+
+fn main() {
+    let listener = TcpListener::bind(BASE_ADDRESS).unwrap();
+    set_clipboard();
+    for stream in listener.incoming() {
+        let stream = stream.unwrap();
+        handle_connection(stream)
+    }
+}
 
 struct File {
     name: String,
@@ -50,7 +58,7 @@ impl Files {
             buf += file.get_path().as_str();
             buf += "\n";
         }
-        fs::write("tmp.vfs", buf).expect("cant write file");
+        file.write(buf.as_ref()).expect("cant write file");
         self
     }
 }
@@ -59,7 +67,6 @@ trait FilesT {
     fn add_file(&mut self, file: File) -> &Self;
     fn rem_file(&mut self, file_name: String) -> &Self;
     fn get_file(&self, file_name: String) -> Option<&File>;
-    fn clone_file(&self, file_name: String) -> Option<File>;
 }
 
 impl File {
@@ -124,26 +131,9 @@ impl FilesT for Files {
     }
 
     fn get_file(&self, file_name: String) -> Option<&File> {
-        let mut index: usize = 0;
-        for file in &self.files {
-            if file.name == file_name {
-                Some(file);
-            }
-            index += 1;
-        }
-        None
+        self.files.iter().find(|file| file.name == file_name)
     }
 
-    fn clone_file(&self, file_name: String) -> Option<File> {
-        let mut index: usize = 0;
-        for file in &self.files {
-            if file.name == file_name {
-                return Some(file.clone());
-            }
-            index += 1;
-        }
-        None
-    }
 }
 
 struct Vfs {
@@ -154,7 +144,7 @@ trait VfsT {
     fn make_address(file: &File) -> String;
     fn allocate(&mut self, file_name: String) -> String;
     fn path_by_name(&self, name: String) -> Option<String>;
-    fn file_by_name(&self, name: String) -> Option<File>;
+    fn get_file_by_name(&self, name: String) -> Option<File>;
 }
 
 impl Vfs {
@@ -165,9 +155,10 @@ impl Vfs {
     }
 
     fn read_tmpvfs() -> Files {
-        let mut files = fs::read_to_string("./tmp.vfs").unwrap();
-        let mut files: Vec<&str> = files.split("\r\n").clone().collect();
+        let files = fs::read_to_string("./tmp.vfs").unwrap();
+        let files: Vec<&str> = files.split("\r\n").clone().collect();
         let mut out = Files::new(vec![]);
+
         for file in files {
             let name_path: Vec<&str> = file.trim().split(NAME_PATH_SPLITTER).collect();
             out.add_file(File::new(
@@ -175,6 +166,7 @@ impl Vfs {
                 name_path.get(1).unwrap_or(&"").to_string())
             );
         }
+
         out
     }
 }
@@ -195,23 +187,29 @@ impl VfsT for Vfs {
                 return Some(file.path);
             }
         }
+
         return None;
     }
 
-    fn file_by_name(&self, name: String) -> Option<File> {
+    fn get_file_by_name(&self, name: String) -> Option<File> {
         for file in self.files.files.clone().into_iter() {
             if file.name == name {
                 return Some(file);
             }
         }
+
         return None;
     }
 }
 
 fn make_contents(file_name: &str) -> Vec<u8> {
-    let contents = fs::read(file_name)
+    let mut contents = fs::read(file_name)
         .unwrap_or(fs::read("tmp.vfs").unwrap());
-    return contents;
+    if contents.len() > MAX_SIZE {
+        contents = "File is bigger than 128 KB".as_bytes().to_vec();
+    }
+
+    contents
 }
 
 fn make_response(file: &File) -> Vec<u8> {
@@ -223,6 +221,7 @@ fn make_response(file: &File) -> Vec<u8> {
         contents.len(),
     );
     let response: Vec<u8> = [response.as_bytes().to_vec(), contents].concat();
+
     response
 }
 
@@ -230,41 +229,53 @@ fn bytes2string<const N: usize>(bytes: TsizeBuf<N>) -> String {
     str::from_utf8(bytes).unwrap().to_string().clone()
 }
 
-fn log_buffer<const N: usize>(buffer: TsizeBuf<N>) {
-    println!("{}", bytes2string(&buffer))
+fn slice_end(input: String, start: usize) -> String {
+    input.get(start..input.find("\0").unwrap()).unwrap().to_string()
 }
 
-fn response_file(mut stream: TcpStream, vfs: Vfs) {
-    let mut buffer = [0u8; 1024];
+fn log_buffer<const N: usize>(buffer: TsizeBuf<N>) {
+    println!("RAW BUFFER DATA: {:#?}", slice_end(bytes2string(&buffer), 0))
+}
+
+fn response_file(headers: &Vec<&str>, stream: &mut TcpStream) {
+    let vfs = Vfs::new();
+    let mut requested_file: String = String::new();
+    match Some(headers.get(1)) {
+        None => return,
+        Some(_) => requested_file = headers.get(1).unwrap().trim_start_matches('/').to_string()
+    }
+    let file = vfs.get_file_by_name(requested_file).unwrap_or(File::new("tmp.vfs".to_string(), "".to_string()));
+
+    stream.write(&make_response(&file)).unwrap();
+    stream.flush().unwrap();
+}
+
+fn set_clipboard() -> bool {
+    let string = format!("wget -f http://{}/", BASE_ADDRESS);
+    cli_clipboard::set_contents(string.to_owned()).unwrap();
+    cli_clipboard::get_contents().unwrap() == string
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let mut buffer = [0u8; 8192];
     stream.read(&mut buffer).unwrap();
+
     #[cfg(debug_assertions)]
     log_buffer(&buffer);
 
     let headers = bytes2string(&buffer);
     let headers: Vec<&str> = headers.split_whitespace().collect();
-    unsafe {
-        let mut requested_file = String::from(headers.get(1).unwrap_unchecked().to_string());
 
-        requested_file.remove(0);
-        let mut file = vfs.file_by_name(requested_file).unwrap_or(File::new("tmp.vfs".to_string(), "".to_string()));
+    if headers.get(0).unwrap() == &"POST" {
+        let mut data: String = bytes2string(&buffer);
+        let headers_len = data.find("\r\n\r\n").unwrap();
+        data = slice_end(data, headers_len+"\r\n\r\n".len());
 
-        stream.write(&*make_response(&file)).unwrap();
-        stream.flush().unwrap();
-    }
-}
-
-fn set_clipboard() {
-    let string = format!("wget -f http://{}/", BASE_ADDRESS);
-    cli_clipboard::set_contents(string.to_owned()).unwrap();
-    assert_eq!(cli_clipboard::get_contents().unwrap(), string);
-}
-
-fn main() {
-    let listener = TcpListener::bind(BASE_ADDRESS).unwrap();
-    set_clipboard();
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
-
-        response_file(stream, Vfs::new());
+        let file_name = headers.get(1).unwrap().to_string();
+        fs::File::create(format!("./{}", file_name)).unwrap().write(data.as_bytes()).unwrap();
+        #[cfg(debug_assertions)]
+        println!("POST DATA: {:#?}", data);
+    } else {
+        response_file(&headers, &mut stream);
     }
 }
